@@ -23,6 +23,12 @@ the current RPM.
 import struct
 import time
 import random
+import os
+
+# Always find sample_data relative to THIS file's own location on disk,
+# so it works no matter which folder you run the script from.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(SCRIPT_DIR, "..", "sample_data", "can_bus.log")
 
 # ---------------------------------------------------------------
 # Bounded operating limits (derived, not guessed)
@@ -130,13 +136,16 @@ class CANSimulator:
         data = struct.pack("B", int(self.motor_temp))
         return CANMessage(0x105, 1, data)
 
-    def run(self, output_file="can_bus.log", cycles=None):
+    def run(self, output_file=None, cycles=None):
         """Main loop: advance physics every 100ms tick, but only send each
         message at its own priority rate:
           - RPM, Speed     -> every tick     (100ms)  [high priority]
           - Voltage        -> every 5 ticks  (500ms)  [medium priority]
           - SOC, Temp      -> every 10 ticks (1000ms) [low priority]
         `cycles=None` runs forever (Ctrl+C to stop); pass a number for a demo."""
+        if output_file is None:
+            output_file = LOG_PATH
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         with open(output_file, "w") as f:
             print(f"CAN simulator started (MAX_RPM={MAX_RPM}), logging to {output_file}")
             count = 0
