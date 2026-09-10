@@ -84,7 +84,7 @@ class CANSimulator:
 
         # 1) RPM: gradually increases, capped at MAX_RPM (the only randomness)
         if self.motor_rpm < MAX_RPM:
-            self.motor_rpm += random.randint(50, 200)
+            self.motor_rpm += random.randint(10, 20)
         self.motor_rpm = min(self.motor_rpm, MAX_RPM)
         load_fraction = self.motor_rpm / MAX_RPM   # 0.0 (idle) to 1.0 (max load)
 
@@ -119,7 +119,7 @@ class CANSimulator:
         return CANMessage(0x101, 2, data)
 
     def frame_speed(self):
-        raw = int(self.vehicle_speed * 10)  # undo the 0.1 scale before sending
+        raw = round(self.vehicle_speed * 10)  # undo the 0.1 scale before sending
         data = struct.pack(">H", raw)
         return CANMessage(0x102, 2, data)
 
@@ -128,7 +128,7 @@ class CANSimulator:
         return CANMessage(0x103, 1, data)
 
     def frame_voltage(self):
-        raw = int(self.battery_voltage * 10)
+        raw = round(self.battery_voltage * 10)
         data = struct.pack(">H", raw)
         return CANMessage(0x104, 2, data)
 
