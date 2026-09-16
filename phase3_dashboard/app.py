@@ -1,36 +1,30 @@
 """
-CAN Bus Dashboard - Phase 3 (v2)
+CAN Bus Dashboard - Phase 3 (v3)
 ----------------------------------
-This replaces dashboard_generator.py with a small Flask web server.
+Small Flask web server. Zero JavaScript anywhere in this file -- every
+page is still an HTML string with {values} filled in, same as before.
 
-WHY THE CHANGE: dashboard_generator.py could only ever show data -- it had
-no way to RECEIVE input from you (like typing in a test CAN ID). A plain
-HTML page with <meta http-equiv="refresh"> can't listen for a form
-submission; something has to be running to catch it. Flask is that
-"something" -- but it's still just Python, and there is ZERO JavaScript
-anywhere in this file. Every page is still built the exact same way as
-before: an HTML string with {values} filled in.
+Four pages:
+  GET  /        -> the outer page shell: embedded live cluster + embedded
+                   error panel + the diagnostics/testing panel
+  GET  /cluster -> JUST the instrument cluster cards, refreshing itself
+                   every 2 seconds
+  GET  /errors  -> JUST the bus-error panel, refreshing itself every
+                   2 seconds, completely separate from /cluster
+  POST /test    -> receives a submitted test, runs it through
+                   extract_signal(), remembers the result, sends you
+                   back to "/" to see it.
 
-Three pages:
-  GET  /        -> the outer page shell: an embedded live cluster + the
-                   diagnostics/testing panel
-  GET  /cluster -> JUST the instrument cluster cards, on its own, refreshing
-                   itself every 2 seconds
-  POST /test    -> receives a submitted test (from a button or the manual
-                   form), runs it through extract_signal(), remembers the
-                   result, then sends you back to "/" to see it.
+WHY THREE SEPARATE LIVE PIECES INSTEAD OF ONE: each auto-refreshing region
+sits in its own <iframe> (a plain HTML tag that shows one page inside
+another). Earlier, the cluster cards AND the error panel were both jammed
+into one iframe with a fixed height -- once the error panel grew past
+that fixed height, it got clipped instead of shown, because the iframe
+had scrolling turned off. Giving the error panel its OWN iframe, sized
+for what it actually contains, fixes that at the root instead of just
+making the box taller and hoping nothing overflows again.
 
-WHY TWO PAGES INSTEAD OF ONE: the outer page ("/") no longer auto-refreshes
-at all. Only the small embedded cluster page ("/cluster") does, using an
-<iframe> -- a plain HTML tag that shows one page inside another, like a
-window. This fixes a real bug: with ONE auto-refreshing page, the whole
-page (including whatever you were mid-typing into the test boxes) reloaded
-every 2 seconds, wiping your input before you could click "Run test". Now
-only the little cluster window refreshes; the boxes you're typing into sit
-outside it and are left alone.
-
-Run this file, then open http://127.0.0.1:5000 in your browser and leave
-the tab open.
+Run this file, then open http://127.0.0.1:5000 and leave the tab open.
 """
 
 import os
@@ -41,30 +35,16 @@ from flask import Flask, request, redirect
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "phase2_parser"))
-from can_parser import parse_log_file, VehicleState, extract_signal, parse_log_line  # noqa: E402
+from can_parser import parse_log_file, VehicleState, extract_signal, parse_log_line, error_summary  # noqa: E402
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------
-# Branding -- edit BRAND_COLOR once you know DAO EVTech's real hex.
-# To show your actual logo: drop a file named exactly "logo.png" into a
-# "static" folder next to this file (phase3_dashboard/static/logo.png).
-# If it's there, it's shown automatically. If not, a plain text wordmark
-# is shown instead -- so the dashboard works either way.
-# ---------------------------------------------------------------
-BRAND_COLOR = "#D60110"  # placeholder teal -- swap for DAO EVTech's real color
+BRAND_COLOR = "#D60110"  # sampled directly from DAO EVTech's real logo
 BRAND_NAME = "DAO EVTech"
 LOGO_PATH = os.path.join(SCRIPT_DIR, "static", "logo.png")
 
-# Holds the result of the most recent test, so it's still visible the next
-# time the page auto-refreshes. A real multi-user app would need something
-# fancier than a plain variable -- for a one-person local demo, this is fine.
 LAST_RESULT = None
 
-
-# ---------------------------------------------------------------
-# Visual tokens -- one place to tune colors per signal
-# ---------------------------------------------------------------
 SIGNAL_COLORS = {
     "Motor_RPM": "#E8A33D",
     "Vehicle_Speed": "#4FB6C4",
@@ -79,11 +59,14 @@ SIGNAL_LABELS = {
     "Battery_Voltage": "Battery voltage",
     "Motor_Temperature": "Motor temperature",
 }
-# Display order for the cluster (dict order from the log isn't guaranteed
-# to match this, since SOC/Temp arrive less often than RPM/Speed).
 SIGNAL_ORDER = ["Motor_RPM", "Vehicle_Speed", "Battery_SOC", "Battery_Voltage", "Motor_Temperature"]
 
-# The 4 required test cases, taken directly from the task doc's Section 8.
+ERROR_LABELS = {
+    "unknown_id": "Unknown CAN ID",
+    "dlc_mismatch": "Incorrect DLC (data too short)",
+    "malformed_line": "Malformed log line",
+}
+
 PRESETS = {
     "test1": {
         "label": "Test 1: Correct parsing",
@@ -108,11 +91,7 @@ PRESETS = {
 }
 
 
-# ---------------------------------------------------------------
-# Small helpers: turn what a person types into real bytes
-# ---------------------------------------------------------------
 def parse_hex_id(text):
-    """'0x101', '101', or '0X101' -> 257. Raises ValueError on bad input."""
     text = text.strip()
     if text.lower().startswith("0x"):
         text = text[2:]
@@ -122,7 +101,6 @@ def parse_hex_id(text):
 
 
 def parse_hex_bytes(text):
-    """'13 88', '13,88', or '0x13 0x88' -> b'\\x13\\x88'."""
     text = text.strip()
     if not text:
         return b""
@@ -136,9 +114,6 @@ def parse_hex_bytes(text):
     return bytes(values)
 
 
-# ---------------------------------------------------------------
-# HTML building -- same f-string approach as before, just more of it
-# ---------------------------------------------------------------
 PAGE_STYLE = """
 :root {
   --bg: #14171a;
@@ -148,55 +123,65 @@ PAGE_STYLE = """
   --text: #ece7dd;
   --text-muted: #8b9096;
   --danger: #d9605f;
+  --ok: #7fb069;
 }
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  padding: 36px 40px 60px;
+  padding: 32px 40px 50px;
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, "Segoe UI", sans-serif;
 }
 h1 { font-size: 21px; font-weight: 600; margin: 0 0 3px 0; letter-spacing: 0.2px; }
 h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px 0; color: var(--text); }
-.timestamp { color: var(--text-muted); font-size: 13px; margin-bottom: 28px; }
+.timestamp { color: var(--text-muted); font-size: 12px; margin-bottom: 22px; }
 .section-note { color: var(--text-muted); font-size: 13px; margin: 0 0 18px 0; max-width: 60ch; }
 
 .brand-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 22px;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 2px solid var(--brand);
 }
-.brand-bar img { height: 36px; display: block; }
-.brand-mark {
-  width: 36px;
-  height: 36px;
+.logo-chip {
+  background: #ffffff;
   border-radius: 8px;
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+}
+.logo-chip img { height: 34px; display: block; }
+.brand-mark {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
   background: var(--brand);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #0c0d0e;
+  color: #fff;
   font-weight: 700;
-  font-size: 15px;
+  font-size: 16px;
   flex-shrink: 0;
 }
-.brand-name { font-size: 16px; font-weight: 600; line-height: 1.2; }
-.brand-tagline { font-size: 12px; color: var(--text-muted); }
+.brand-name { font-size: 17px; font-weight: 700; line-height: 1.2; letter-spacing: 0.2px; }
+.brand-tagline { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
 
 .cluster {
   display: flex;
   flex-wrap: wrap;
-  gap: 18px;
-  max-width: 960px;
-  margin-bottom: 48px;
+  gap: 16px;
+  max-width: 920px;
 }
 .card {
   background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 20px 22px;
+  padding: 18px 20px;
   flex: 1 1 190px;
   position: relative;
   overflow: hidden;
@@ -208,16 +193,17 @@ h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px 0; color: var(--text); }
   height: 3px;
   background: var(--accent);
 }
-.label { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; }
+.label { font-size: 12px; color: var(--text-muted); margin-bottom: 9px; }
 .value {
   font-family: "SF Mono", Consolas, monospace;
-  font-size: 34px;
+  font-size: 32px;
   font-weight: 600;
   color: var(--accent);
+  line-height: 1;
 }
-.unit { font-size: 15px; color: var(--text-muted); margin-left: 6px; font-weight: 400; }
+.unit { font-size: 14px; color: var(--text-muted); margin-left: 6px; font-weight: 400; }
 .bar-track {
-  margin-top: 14px;
+  margin-top: 13px;
   height: 5px;
   background: #0f1113;
   border-radius: 3px;
@@ -230,19 +216,18 @@ h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px 0; color: var(--text); }
   transition: width 0.6s ease;
 }
 .warning {
-  margin-top: 12px;
-  font-size: 12px;
+  margin-top: 11px;
+  font-size: 11px;
   color: var(--danger);
   line-height: 1.4;
 }
 .empty-state {
   border: 1px dashed var(--border);
   border-radius: 10px;
-  padding: 28px;
+  padding: 26px;
   color: var(--text-muted);
   font-size: 14px;
-  max-width: 520px;
-  margin-bottom: 48px;
+  max-width: 500px;
 }
 .empty-state code {
   background: var(--panel-2);
@@ -251,26 +236,57 @@ h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px 0; color: var(--text); }
   font-family: "SF Mono", Consolas, monospace;
 }
 
-/* --- Diagnostics panel: deliberately looks like a scan-tool, not a card --- */
+.error-panel {
+  border-radius: 10px;
+  padding: 14px 20px;
+  font-size: 13px;
+  height: 100%;
+  overflow-y: auto;
+}
+.error-panel.clean {
+  border: 1px solid #2c4a37;
+  background: #16211b;
+}
+.error-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+.error-panel.has-errors {
+  border: 1px solid #4a2c2d;
+  background: #1c1516;
+}
+.error-total { color: var(--danger); font-weight: 600; }
+.error-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-muted);
+  padding: 5px 0;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+.error-row:first-of-type { border-top: none; margin-top: 8px; }
+.error-row b { color: var(--danger); font-family: "SF Mono", Consolas, monospace; font-weight: 600; }
+
 .diagnostics {
   max-width: 720px;
   border: 1px solid var(--border);
   background: #16191c;
-  padding: 26px 28px 28px;
+  padding: 24px 26px 26px;
 }
 .diagnostics-header {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 14px;
-  margin-bottom: 20px;
+  padding-bottom: 13px;
+  margin-bottom: 18px;
 }
 .preset-row {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin-bottom: 22px;
+  margin-bottom: 20px;
 }
 button {
   font-family: -apple-system, "Segoe UI", sans-serif;
@@ -294,7 +310,7 @@ button:hover { border-color: #454b51; }
   align-items: end;
   flex-wrap: wrap;
   border-top: 1px solid var(--border);
-  padding-top: 20px;
+  padding-top: 18px;
 }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field label { font-size: 12px; color: var(--text-muted); }
@@ -309,8 +325,8 @@ button:hover { border-color: #454b51; }
   width: 170px;
 }
 .result {
-  margin-top: 22px;
-  padding: 16px 18px;
+  margin-top: 20px;
+  padding: 15px 18px;
   border-radius: 6px;
   font-size: 13px;
   line-height: 1.7;
@@ -319,30 +335,37 @@ button:hover { border-color: #454b51; }
 .result.fail { background: #26191a; border: 1px solid #4a2c2d; }
 .result.info { background: #171b1e; border: 1px solid var(--border); }
 .verdict { font-weight: 600; font-family: "SF Mono", Consolas, monospace; letter-spacing: 0.3px; }
-.verdict.pass { color: #6fcf64; }
+.verdict.pass { color: var(--ok); }
 .verdict.fail { color: var(--danger); }
 .result-row { color: var(--text-muted); }
 .result-row b { color: var(--text); font-weight: 500; }
 
+.live-row {
+  display: flex;
+  gap: 16px;
+  max-width: 920px;
+  align-items: stretch;
+  margin-bottom: 28px;
+}
 .cluster-frame {
-  width: 100%;
-  max-width: 960px;
-  height: 400px;
+  flex: 1 1 660px;
+  min-width: 0;
+  height: 380px;
   border: none;
   background: var(--bg);
-  display: block;
-  margin-bottom: 32px;
+}
+.error-frame {
+  flex: 1 1 240px;
+  min-width: 220px;
+  height: 380px;
+  border: none;
+  background: var(--bg);
 }
 """
 
-# Small separate style tag just for the brand color, kept apart from the
-# big PAGE_STYLE string above so editing BRAND_COLOR can never break the
-# rest of the CSS (plain strings vs. f-strings handle { } differently).
 BRAND_STYLE = f":root {{ --brand: {BRAND_COLOR}; }}"
 
-# Slimmer body padding for the page that lives INSIDE the iframe, so it
-# doesn't get double spacing (the outer page already has its own padding).
-CLUSTER_PAGE_STYLE = PAGE_STYLE + "\nbody { padding: 4px 4px 20px; }\n"
+FRAME_PAGE_STYLE = PAGE_STYLE + "\nbody { padding: 6px 4px; }\n"
 
 
 def build_card_html(name, signal):
@@ -379,6 +402,32 @@ def build_cluster_html(snapshot):
     return f'<div class="cluster">{cards}\n    </div>'
 
 
+def build_error_panel_html():
+    counts = error_summary()
+
+    if not counts:
+        return """
+    <div class="error-panel clean">
+      <div class="error-summary-row">
+        <b style="color:var(--ok); font-family:'SF Mono',Consolas,monospace;">0 bus errors</b>
+      </div>
+      <div class="error-summary-row" style="margin-top:6px;">
+        No unknown IDs, DLC mismatches, or malformed frames detected.
+      </div>
+    </div>"""
+
+    rows = "".join(
+        f'<div class="error-row"><span>{ERROR_LABELS.get(reason, reason)}</span><b>{count}</b></div>'
+        for reason, count in counts.items()
+    )
+    total = sum(counts.values())
+    return f"""
+    <div class="error-panel has-errors">
+      <div class="error-summary-row"><span class="error-total">{total} bus error(s) detected</span></div>
+      {rows}
+    </div>"""
+
+
 def build_result_html(result):
     if result is None:
         return ""
@@ -402,7 +451,6 @@ def build_result_html(result):
       {rows}
     </div>"""
 
-    # Normal single decode result (preset 1/2/3 or manual entry)
     lines = [f'<div class="result-row">Sent: <b>ID 0x{result["can_id"]:03X}, data [{result["bytes_display"]}]</b></div>']
 
     if result["decoded"] is None:
@@ -424,11 +472,8 @@ def build_result_html(result):
 
 
 def build_brand_html():
-    """Shows your real logo if static/logo.png exists, otherwise a plain
-    text wordmark using BRAND_COLOR. Either way, works with no internet
-    connection -- important for a live presentation."""
     if os.path.exists(LOGO_PATH):
-        mark_html = f'<img src="/static/logo.png" alt="{BRAND_NAME} logo">'
+        mark_html = f'<div class="logo-chip"><img src="/static/logo.png" alt="{BRAND_NAME} logo"></div>'
     else:
         initial = BRAND_NAME[0]
         mark_html = f'<div class="brand-mark">{initial}</div>'
@@ -444,16 +489,13 @@ def build_brand_html():
 
 
 def build_cluster_page(snapshot):
-    """The small page that lives INSIDE the iframe. This is the only page
-    that still auto-refreshes -- everything in here is safe to reload every
-    2 seconds because there's nothing here for you to type into."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="refresh" content="2">
-  <style>{CLUSTER_PAGE_STYLE}{BRAND_STYLE}</style>
+  <style>{FRAME_PAGE_STYLE}{BRAND_STYLE}</style>
 </head>
 <body>
   {build_brand_html()}
@@ -464,10 +506,23 @@ def build_cluster_page(snapshot):
 """
 
 
-def build_shell_page(result_html):
-    """The outer page: the iframe (live numbers) + the diagnostics panel
-    (stable -- never reloads on its own, so typing here is never disturbed)."""
+def build_errors_page():
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="2">
+  <style>{FRAME_PAGE_STYLE}{BRAND_STYLE}</style>
+</head>
+<body style="padding: 10px;">
+  <div class="label" style="margin-bottom: 10px;">Bus health</div>
+  {build_error_panel_html()}
+</body>
+</html>
+"""
 
+
+def build_shell_page(result_html):
     preset_buttons = "".join(
         f"""<form method="POST" action="/test" style="margin:0;">
               <input type="hidden" name="mode" value="preset">
@@ -489,7 +544,10 @@ def build_shell_page(result_html):
   <style>{PAGE_STYLE}{BRAND_STYLE}</style>
 </head>
 <body>
-  <iframe class="cluster-frame" src="/cluster" scrolling="no"></iframe>
+  <div class="live-row">
+    <iframe class="cluster-frame" src="/cluster" scrolling="no"></iframe>
+    <iframe class="error-frame" src="/errors" scrolling="no"></iframe>
+  </div>
 
   <div class="diagnostics">
     <div class="diagnostics-header">
@@ -527,9 +585,6 @@ def build_shell_page(result_html):
 """
 
 
-# ---------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------
 @app.route("/")
 def dashboard():
     return build_shell_page(build_result_html(LAST_RESULT))
@@ -542,6 +597,11 @@ def cluster():
     for s in signals:
         state.update(s)
     return build_cluster_page(state.snapshot())
+
+
+@app.route("/errors")
+def errors():
+    return build_errors_page()
 
 
 @app.route("/test", methods=["POST"])
@@ -602,7 +662,7 @@ def run_test():
                     LAST_RESULT["expected_text"] = expected_text
                     LAST_RESULT["passed"] = passed
                 except ValueError:
-                    pass  # not a number -- just skip the pass/fail comparison
+                    pass
         except ValueError:
             LAST_RESULT = {
                 "status": "error",

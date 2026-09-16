@@ -10,16 +10,16 @@ of the Vector .dbc text format. One entry per CAN ID.
 
 import struct
 import os
+from datetime import datetime
 
 # Same trick as the simulator: find sample_data relative to THIS file's
 # own location, so it doesn't matter which folder you run this script from.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(SCRIPT_DIR, "..", "sample_data", "can_bus.log")
+ERROR_LOG_PATH = os.path.join(SCRIPT_DIR, "..", "sample_data", "error_log.txt")
 
 
 # --- DBC spec: official ranges from the task document ---
-# (Not the simulator's tighter operating bounds -- the parser must be able
-#  to correctly validate ANY frame that matches this spec, from any sender.)
 message_specs = {
     0x101: {
         "name": "Motor_RPM",
@@ -75,31 +75,22 @@ message_specs = {
 
 
 def extract_signal(can_id, data_bytes):
-    """Decode one CAN frame's raw bytes into a real value, using the DBC spec.
-
-    Returns a dict like {"name": "Motor_RPM", "value": 5160, "unit": "RPM"}
-    or None if the ID is unknown / the data is too short (bad frame).
-    """
     spec = message_specs.get(can_id)
     if spec is None:
-        return None  # unknown CAN ID -- not in our DBC
+        return None
 
     length = spec["length_bytes"]
     if len(data_bytes) < length:
-        return None  # malformed frame -- fewer bytes than the spec expects
+        return None
 
     relevant_bytes = data_bytes[:length]
 
-    # Unpack the raw integer, matching byte width and byte order to the spec
     if length == 2:
         fmt = ">H" if spec["byte_order"] == "big" else "<H"
     else:
-        fmt = "B"  # single byte, no order to worry about
+        fmt = "B"
     raw = struct.unpack(fmt, relevant_bytes)[0]
 
-    # The core DBC formula: real value = raw * scale + offset
-    # Rounded to 2 decimals to avoid floating point noise (e.g. 0.1 * 29 in
-    # binary doesn't come out to exactly 2.9 -- this is just display cleanup).
     value = round(raw * spec["scale"] + spec["offset"], 2)
 
     warning = None
@@ -121,11 +112,6 @@ def extract_signal(can_id, data_bytes):
 
 
 def parse_log_line(line):
-    """Turns one raw log line like:
-        'ID: 0x101 DLC: 2 Data: [00 99]'
-    into (can_id, data_bytes), e.g. (0x101, b'\\x00\\x99').
-    Returns None for blank or badly formatted lines instead of crashing.
-    """
     line = line.strip()
     if not line:
         return None
@@ -139,22 +125,61 @@ def parse_log_line(line):
 
         return can_id, data_bytes
     except (IndexError, ValueError):
-        return None  # line didn't match the expected format
+        return None
+
+
+def classify_error(line):
+    """Figures out WHY a line can't be decoded, instead of just silently
+    giving up. Returns None if the line is actually fine, or a short
+    reason string otherwise:
+      'malformed_line' -- couldn't even be split into ID/bytes
+      'unknown_id'     -- ID isn't in our DBC at all
+      'dlc_mismatch'   -- fewer data bytes than the spec expects
+    """
+    parsed = parse_log_line(line)
+    if parsed is None:
+        return "malformed_line"
+
+    can_id, data_bytes = parsed
+    spec = message_specs.get(can_id)
+    if spec is None:
+        return "unknown_id"
+    if len(data_bytes) < spec["length_bytes"]:
+        return "dlc_mismatch"
+    return None
+
+
+def log_error(reason, line):
+    """Optional: appends one line to error_log.txt as a running audit
+    trail. NOT used for counting anymore (see error_summary below) --
+    kept only if you want a persistent history of bad frames to look
+    through later. Safe to call as often as you like; it just grows."""
+    os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    with open(ERROR_LOG_PATH, "a") as f:
+        f.write(f"[{timestamp}] {reason}: {line.strip()}\n")
 
 
 def parse_log_file(path=None):
     """Reads every line of the log file, decodes each into a real signal
-    value, and returns a list of decoded signals in the order they appear."""
+    value, and returns a list of decoded signals in the order they appear.
+    Bad lines are simply skipped here -- error COUNTING is handled
+    separately by error_summary(), which re-scans the log fresh on every
+    call instead of accumulating across repeated calls (see its
+    docstring for why that distinction matters)."""
     if path is None:
         path = LOG_PATH
 
     decoded_signals = []
     with open(path) as f:
         for line in f:
-            parsed = parse_log_line(line)
-            if parsed is None:
-                continue  # skip blank/bad lines
-            can_id, data_bytes = parsed
+            if not line.strip():
+                continue  # skip truly blank lines
+
+            if classify_error(line) is not None:
+                continue  # bad frame -- counted separately by error_summary()
+
+            can_id, data_bytes = parse_log_line(line)
             signal = extract_signal(can_id, data_bytes)
             if signal is not None:
                 decoded_signals.append(signal)
@@ -190,6 +215,35 @@ def track_latest_values(path=None):
     return state.snapshot()
 
 
+def error_summary(path=None):
+    """Counts bus errors currently present in the log file, RIGHT NOW --
+    freshly re-scanning can_bus.log on every call instead of reading from
+    a file that keeps growing across calls.
+
+    WHY THIS MATTERS: this used to read from error_log.txt, which
+    parse_log_file() appended to every time it ran. Since the dashboard
+    re-parses the whole log every 2 seconds (to keep the live view
+    updating), it kept re-detecting the SAME bad frames and appending
+    them AGAIN each time -- so the count grew forever, even with the
+    simulator stopped and the log completely unchanged. Counting fresh
+    from the log itself fixes that: the number always reflects what's
+    actually in can_bus.log at this moment, not how many times this
+    function has been called since the dashboard started."""
+    if path is None:
+        path = LOG_PATH
+    counts = {}
+    if not os.path.exists(path):
+        return counts
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            reason = classify_error(line)
+            if reason is not None:
+                counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 if __name__ == "__main__":
     print("--- Every decoded frame, in order ---")
     for signal in parse_log_file():
@@ -201,3 +255,11 @@ if __name__ == "__main__":
     final_state = track_latest_values()
     for name, signal in final_state.items():
         print(f"{name}: {signal['value']} {signal['unit']}")
+
+    print("\n--- Error summary ---")
+    errors = error_summary()
+    if not errors:
+        print("No errors detected.")
+    else:
+        for reason, count in errors.items():
+            print(f"{reason}: {count}")

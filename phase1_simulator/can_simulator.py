@@ -42,6 +42,8 @@ RPM_TO_KMH = WHEEL_CIRCUMFERENCE_M * 60 / 1000          # = 0.018
 # Max RPM is whatever RPM produces exactly TOP_SPEED_KMH
 MAX_RPM = round(TOP_SPEED_KMH / RPM_TO_KMH)              # = 5500
 
+ERROR_INJECTION_CHANCE = 0.02  # ~2% chance per tick of a simulated bus error
+
 TOP_TEMP_C = 120              # motor over-temperature warning threshold
 LOW_BATTERY_SOC = 20          # battery percentage that triggers a low-battery warning
 
@@ -136,6 +138,18 @@ class CANSimulator:
         data = struct.pack("B", int(self.motor_temp))
         return CANMessage(0x105, 1, data)
 
+    def maybe_build_error_frame(self):
+          """Occasionally returns a deliberately broken line instead of None,
+          simulating real bus noise/errors. Returns None most of the time
+          (meaning: no error this tick)."""
+          if random.random() > ERROR_INJECTION_CHANCE:
+                return None  # no error this tick -- this is the normal case
+
+          error_type = random.choice(["unknown_id", "dlc_mismatch"])
+          if error_type == "unknown_id":
+                return "ID: 0x1FF DLC: 2 Data: [00 00]"  # 0x1FF isn't in our DBC
+          else:
+                return "ID: 0x101 DLC: 2 Data: [14]"  # claims 2 bytes, only gives 1
     def run(self, output_file=None, cycles=None):
         """Main loop: advance physics every 100ms tick, but only send each
         message at its own priority rate:
@@ -166,6 +180,12 @@ class CANSimulator:
                         f.write(str(msg) + "\n")
                     for w in self.check_warnings():
                         print(f"  [!] {w}")
+
+                    error_line = self.maybe_build_error_frame()
+                    if error_line:
+                        print(f"[ERROR INJECTED] {error_line}")
+                        f.write(error_line + "\n")
+
                     f.flush()
                     time.sleep(0.1)
                     count += 1
